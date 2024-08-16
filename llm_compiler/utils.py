@@ -2,6 +2,8 @@ from typing import Any
 from langchain_core.runnables import RunnableLambda, RunnableWithFallbacks
 from langchain_core.messages import ToolMessage
 from langgraph.prebuilt import ToolNode
+from langchain_core.tools import tool
+from langchain_community.utilities import SQLDatabase
 
 def create_tool_node_with_fallback(tools: list) -> RunnableWithFallbacks[Any, dict]:
     return ToolNode(tools).with_fallbacks(
@@ -20,3 +22,13 @@ def handle_tool_error(state) -> dict:
             for tc in tool_calls
         ]
     }
+
+@tool
+def db_query_tool(query: str) -> str:
+    db = SQLDatabase.from_uri("sqlite:///Chinook.db")
+    result = db.run_no_throw(query)
+    if not result:
+        logging.error(f"Query failed: {query}")
+        return "Error: Query failed. Please rewrite your query and try again."
+    logging.info(f"Query executed successfully: {query}")
+    return result

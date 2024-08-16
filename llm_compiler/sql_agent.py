@@ -13,6 +13,7 @@ from llm_compiler.utils import create_tool_node_with_fallback
 from llm_compiler.planner import create_planner, stream_plan
 from llm_compiler.scheduler import schedule_tasks
 from llm_compiler.output_parser import LLMCompilerPlanParser
+from llm_compiler.utils import db_query_tool
 
 class State(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
@@ -20,15 +21,11 @@ class State(TypedDict):
 class SubmitFinalAnswer(BaseModel):
     final_answer: str = Field(..., description="The final answer to the user")
 
-@tool
-def db_query_tool(query: str) -> str:
-    db = SQLDatabase.from_uri("sqlite:///Chinook.db")
-    result = db.run_no_throw(query)
-    if not result:
-        return "Error: Query failed. Please rewrite your query and try again."
-    return result
+
+import logging
 
 def create_sql_agent(llm: ChatOpenAI):
+    logging.basicConfig(level=logging.INFO)
     db = SQLDatabase.from_uri("sqlite:///Chinook.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
@@ -122,6 +119,7 @@ def create_sql_agent(llm: ChatOpenAI):
     workflow.add_node("correct_query", lambda state: {
         "messages": [query_check.invoke({"messages": [state["messages"][-1]]})]
     })
+    from llm_compiler.utils import db_query_tool
     workflow.add_node("execute_query", create_tool_node_with_fallback([db_query_tool]))
 
     def should_continue(state: State) -> Literal[END, "correct_query", "query_gen"]:
