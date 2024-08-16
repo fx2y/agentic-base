@@ -1,6 +1,7 @@
 from typing import Any
 from langchain_core.runnables import RunnableLambda, RunnableWithFallbacks
 from langchain_core.messages import ToolMessage
+from langgraph.prebuilt import ToolNode
 
 def create_tool_node_with_fallback(tools: list) -> RunnableWithFallbacks[Any, dict]:
     return ToolNode(tools).with_fallbacks(

@@ -1,5 +1,5 @@
-from typing import Annotated, Literal, List
-from langchain_core.messages import AIMessage, BaseMessage
+from typing import Annotated, Literal, List, TypedDict
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
