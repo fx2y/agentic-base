@@ -105,6 +105,8 @@ def create_sql_agent(llm: ChatOpenAI):
     from llm_compiler.scheduler import schedule_tasks
     from llm_compiler.output_parser import LLMCompilerPlanParser
 
+    # Define prompt if it is not already defined
+    prompt = ""  # Placeholder, replace with actual prompt if available
     planner = create_planner(llm, tools, prompt)
     workflow.add_node("first_tool_call", lambda state: {
         "messages": [
