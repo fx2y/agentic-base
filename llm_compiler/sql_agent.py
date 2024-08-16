@@ -26,6 +26,7 @@ import logging
 
 def create_sql_agent(llm: ChatOpenAI):
     logging.basicConfig(level=logging.INFO)
+    logging.info("SQL agent workflow initialized.")
     db = SQLDatabase.from_uri("sqlite:///Chinook.db")
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     tools = toolkit.get_tools()
@@ -80,22 +81,31 @@ def create_sql_agent(llm: ChatOpenAI):
     query_gen = query_gen_prompt | llm.bind_tools([SubmitFinalAnswer])
 
     def query_gen_node(state: State):
-        message = query_gen.invoke(state)
-        tool_messages = []
-        if message.tool_calls:
-            for tc in message.tool_calls:
-                if tc["name"] != "SubmitFinalAnswer":
-                    tool_messages.append(
-                        ToolMessage(
-                            content=f"Error: The wrong tool was called: {tc['name']}. Please fix your mistakes. Remember to only call SubmitFinalAnswer to submit the final answer. Generated queries should be outputted WITHOUT a tool call.",
-                            tool_call_id=tc["id"],
-                        )
-                    )
-        else:
+        try:
+            message = query_gen.invoke(state)
             tool_messages = []
-        return {"messages": [message] + tool_messages}
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    if tc["name"] != "SubmitFinalAnswer":
+                        tool_messages.append(
+                            ToolMessage(
+                                content=f"Error: The wrong tool was called: {tc['name']}. Please fix your mistakes. Remember to only call SubmitFinalAnswer to submit the final answer. Generated queries should be outputted WITHOUT a tool call.",
+                                tool_call_id=tc["id"],
+                            )
+                        )
+            else:
+                tool_messages = []
+            return {"messages": [message] + tool_messages}
+        except Exception as e:
+            logging.error(f"Error in query_gen_node: {e}")
+            return {"messages": [ToolMessage(content=f"Error: {repr(e)}", tool_call_id="error")]}
 
     workflow = StateGraph(State)
+    from llm_compiler.planner import create_planner, stream_plan
+    from llm_compiler.scheduler import schedule_tasks
+    from llm_compiler.output_parser import LLMCompilerPlanParser
+
+    planner = create_planner(llm, tools, prompt)
     workflow.add_node("first_tool_call", lambda state: {
         "messages": [
             AIMessage(
@@ -113,14 +123,16 @@ def create_sql_agent(llm: ChatOpenAI):
     workflow.add_node("list_tables_tool", create_tool_node_with_fallback([list_tables_tool]))
     workflow.add_node("get_schema_tool", create_tool_node_with_fallback([get_schema_tool]))
     workflow.add_node("model_get_schema", lambda state: {
-        "messages": [llm.bind_tools([get_schema_tool]).invoke(state["messages"])],
+        "messages": [planner.invoke(state["messages"])],
     })
     workflow.add_node("query_gen", query_gen_node)
     workflow.add_node("correct_query", lambda state: {
         "messages": [query_check.invoke({"messages": [state["messages"][-1]]})]
     })
     from llm_compiler.utils import db_query_tool
-    workflow.add_node("execute_query", create_tool_node_with_fallback([db_query_tool]))
+    workflow.add_node("execute_query", lambda state: {
+        "messages": schedule_tasks({"messages": state["messages"], "tasks": stream_plan(planner, state["messages"])})
+    })
 
     def should_continue(state: State) -> Literal[END, "correct_query", "query_gen"]:
         messages = state["messages"]
