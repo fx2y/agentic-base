@@ -1,4 +1,7 @@
-from typing import List, TypedDict
+import logging
+import time
+from functools import lru_cache
+from typing import List, TypedDict, Optional
 
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
@@ -8,6 +11,24 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, END
+
+
+class MetricsTracker:
+    def __init__(self):
+        self.start_time = time.time()
+        self.metrics = {}
+
+    def track(self, key, value):
+        self.metrics[key] = value
+
+    def get_metrics(self):
+        self.metrics['total_time'] = time.time() - self.start_time
+        return self.metrics
+
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class GraphState(TypedDict):
@@ -24,14 +45,27 @@ class GradeDocuments(BaseModel):
     )
 
 
+class CRAGAgentConfig:
+    def __init__(self, relevance_threshold: float = 0.5, max_web_searches: int = 3):
+        self.relevance_threshold = relevance_threshold
+        self.max_web_searches = max_web_searches
+
+
 class CRAGAgent:
-    def __init__(self, llm, retriever):
+    def __init__(self, llm, retriever, config: Optional[CRAGAgentConfig] = None):
         self.llm = llm
         self.retriever = retriever
         self.web_search_tool = TavilySearchResults()
         self.rag_chain = self._create_rag_chain()
         self.retrieval_grader = self._create_retrieval_grader()
         self.graph = self._create_graph()
+        self.config = config or CRAGAgentConfig()
+        self.retrieve_documents = lru_cache(maxsize=100)(self.retrieve_documents)
+        self.metrics_tracker = MetricsTracker()
+
+    @lru_cache(maxsize=100)
+    def retrieve_documents(self, question: str):
+        return self.retriever.invoke(question)
 
     def _create_rag_chain(self):
         prompt = PromptTemplate(
@@ -93,62 +127,87 @@ class CRAGAgent:
         return workflow.compile()
 
     def retrieve(self, state: GraphState) -> GraphState:
-        question = state["question"]
-        documents = self.retriever.invoke(question)
-        steps = state["steps"]
-        steps.append("retrieve_documents")
-        return {"documents": documents, "question": question, "steps": steps}
+        try:
+            start_time = time.time()
+            question = state["question"]
+            documents = self.retrieve_documents(question)
+            steps = state["steps"]
+            steps.append("retrieve_documents")
+            logger.info(f"Retrieved {len(documents)} documents for question: {question}")
+            self.metrics_tracker.track('retrieve_time', time.time() - start_time)
+            self.metrics_tracker.track('num_documents_retrieved', len(documents))
+            return {"documents": documents, "question": question, "steps": steps}
+        except Exception as e:
+            logger.error(f"Error in retrieve: {str(e)}")
+            return {"error": str(e), "question": state["question"], "steps": state["steps"]}
 
     def generate(self, state: GraphState) -> GraphState:
-        question = state["question"]
-        documents = state["documents"]
-        generation = self.rag_chain.invoke({"documents": documents, "question": question})
-        steps = state["steps"]
-        steps.append("generate_answer")
-        return {
-            "documents": documents,
-            "question": question,
-            "generation": generation,
-            "steps": steps,
-        }
+        try:
+            question = state["question"]
+            documents = state["documents"]
+            generation = self.rag_chain.invoke({"documents": documents, "question": question})
+            steps = state["steps"]
+            steps.append("generate_answer")
+            logger.info(f"Generated answer for question: {question}")
+            return {
+                "documents": documents,
+                "question": question,
+                "generation": generation,
+                "steps": steps,
+            }
+        except Exception as e:
+            logger.error(f"Error in generate: {str(e)}")
+            return {"error": str(e), "question": state["question"], "steps": state["steps"]}
 
     def grade_documents(self, state: GraphState) -> GraphState:
-        question = state["question"]
-        documents = state["documents"]
-        steps = state["steps"]
-        steps.append("grade_document_retrieval")
-        filtered_docs = []
-        search = "No"
-        for d in documents:
-            score = self.retrieval_grader.invoke(
-                {"question": question, "documents": d.page_content}
-            )
-            grade = score.binary_score
-            if grade == "yes":
-                filtered_docs.append(d)
-            else:
-                search = "Yes"
-                continue
-        return {
-            "documents": filtered_docs,
-            "question": question,
-            "search": search,
-            "steps": steps,
-        }
+        try:
+            question = state["question"]
+            documents = state["documents"]
+            steps = state["steps"]
+            steps.append("grade_document_retrieval")
+            filtered_docs = []
+            search = "No"
+            for d in documents:
+                score = self.retrieval_grader.invoke(
+                    {"question": question, "documents": d.page_content}
+                )
+                grade = score.binary_score
+                if grade == "yes" and float(score.confidence) >= self.config.relevance_threshold:
+                    filtered_docs.append(d)
+                else:
+                    search = "Yes"
+                    continue
+            logger.info(f"Graded documents: {len(filtered_docs)} relevant out of {len(documents)}")
+            return {
+                "documents": filtered_docs,
+                "question": question,
+                "search": search,
+                "steps": steps,
+            }
+        except Exception as e:
+            logger.error(f"Error in grade_documents: {str(e)}")
+            return {"error": str(e), "question": state["question"], "steps": state["steps"]}
 
     def web_search(self, state: GraphState) -> GraphState:
-        question = state["question"]
-        documents = state.get("documents", [])
-        steps = state["steps"]
-        steps.append("web_search")
-        web_results = self.web_search_tool.invoke({"query": question})
-        documents.extend(
-            [
-                Document(page_content=d["content"], metadata={"url": d["url"]})
-                for d in web_results
-            ]
-        )
-        return {"documents": documents, "question": question, "steps": steps}
+        try:
+            question = state["question"]
+            documents = state.get("documents", [])
+            steps = state["steps"]
+            steps.append("web_search")
+            web_results = self.web_search_tool.invoke(
+                {"query": question, "max_results": self.config.max_web_searches}
+            )
+            documents.extend(
+                [
+                    Document(page_content=d["content"], metadata={"url": d["url"]})
+                    for d in web_results
+                ]
+            )
+            logger.info(f"Performed web search for question: {question}")
+            return {"documents": documents, "question": question, "steps": steps}
+        except Exception as e:
+            logger.error(f"Error in web_search: {str(e)}")
+            return {"error": str(e), "question": state["question"], "steps": state["steps"]}
 
     @staticmethod
     def decide_to_generate(state: GraphState) -> str:
@@ -156,13 +215,22 @@ class CRAGAgent:
         return "search" if search == "Yes" else "generate"
 
     def run(self, question: str, config: RunnableConfig) -> dict:
-        return self.graph.invoke(
-            {"question": question, "steps": []},
-            config
-        )
+        try:
+            logger.info(f"Starting CRAG agent for question: {question}")
+            result = self.graph.invoke(
+                {"question": question, "steps": []},
+                config
+            )
+            logger.info(f"CRAG agent completed for question: {question}")
+            result['metrics'] = self.metrics_tracker.get_metrics()
+            return result
+        except Exception as e:
+            logger.error(f"Error in CRAG agent run: {str(e)}")
+            return {"error": str(e), "question": question}
 
 # Usage
 # llm = ChatOpenAI(model_name="gpt-4", temperature=0)
 # retriever = vectorstore.as_retriever(k=4)
-# crag_agent = CRAGAgent(llm, retriever)
+# config = CRAGAgentConfig(relevance_threshold=0.6, max_web_searches=2)
+# crag_agent = CRAGAgent(llm, retriever, config)
 # response = crag_agent.run("What are the types of agent memory?", {"configurable": {"thread_id": str(uuid.uuid4())}})
